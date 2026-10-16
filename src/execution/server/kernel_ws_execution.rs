@@ -86,7 +86,7 @@ mod tests {
             }
         });
 
-        let ws = KernelWebSocket::connect(&format!("ws://{}/api/kernels/k/channels", addr))
+        let ws = KernelWebSocket::connect(&format!("ws://{}/api/kernels/k/channels", addr), "")
             .await
             .unwrap();
 
@@ -147,7 +147,7 @@ mod tests {
             }
         });
 
-        let ws = KernelWebSocket::connect(&format!("ws://{}/api/kernels/k/channels", addr))
+        let ws = KernelWebSocket::connect(&format!("ws://{}/api/kernels/k/channels", addr), "")
             .await
             .unwrap();
 

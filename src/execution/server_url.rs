@@ -46,6 +46,11 @@ fn append_parts<'a>(server_url: &str, parts: impl Iterator<Item = &'a str>) -> R
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| anyhow::anyhow!("Server URL cannot be a base"))?;
+        // A trailing slash on the server URL (as `jupyter server list` and
+        // `nb connect --server https://hub/user/x/` supply) must not become an
+        // empty segment, which would serialize as `//api/...` and be
+        // redirected (302) by JupyterHub instead of reaching the API.
+        segments.pop_if_empty();
         for part in parts {
             segments.push(part);
         }
@@ -112,6 +117,25 @@ pub fn ws_endpoint(server_url: &str, segments: &[&str]) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailing_slash_on_server_url_does_not_double_slash() {
+        let u = endpoint("https://hub/user/pepe@bright.ai/", &["api", "contents"]).unwrap();
+        assert_eq!(u.as_str(), "https://hub/user/pepe@bright.ai/api/contents");
+        let u = endpoint("http://127.0.0.1:8888/", &["api"]).unwrap();
+        assert_eq!(u.as_str(), "http://127.0.0.1:8888/api");
+        // The empty-path collaboration probe still ends in a slash.
+        let u = endpoint_with_path(
+            "https://hub/user/pepe@bright.ai/",
+            &["api", "collaboration", "session"],
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://hub/user/pepe@bright.ai/api/collaboration/session/"
+        );
+    }
 
     #[test]
     fn normalize_accepts_plain_root_url() {

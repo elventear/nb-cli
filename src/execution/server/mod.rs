@@ -1,5 +1,6 @@
 //! Remote execution backend using Jupyter Server API
 
+pub mod auth;
 pub mod client;
 mod kernel_ws_execution;
 pub mod output_conversion;
@@ -59,7 +60,7 @@ impl RemoteExecutor {
             .as_ref()
             .context("Jupyter session not available")?;
         let ws_url = client.get_ws_url(&session.kernel.id, Some(&session.id));
-        let ws = KernelWebSocket::connect(&ws_url)
+        let ws = KernelWebSocket::connect(&ws_url, client.token())
             .await
             .context("Failed to reconnect to kernel WebSocket")?;
         self.ws = Some(ws);
@@ -140,7 +141,7 @@ impl ExecutionBackend for RemoteExecutor {
 
         // Connect to kernel via WebSocket with session_id
         let ws_url = client.get_ws_url(&session.kernel.id, Some(&session.id));
-        let mut ws = KernelWebSocket::connect(&ws_url)
+        let mut ws = KernelWebSocket::connect(&ws_url, client.token())
             .await
             .context("Failed to connect to kernel WebSocket")?;
 

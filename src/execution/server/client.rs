@@ -1,5 +1,6 @@
 //! HTTP client for Jupyter Server REST API
 
+use crate::execution::server::auth;
 use crate::execution::server_url;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,9 @@ impl JupyterClient {
     /// Create a new Jupyter Server client. The URL is validated and
     /// normalized eagerly so a bad URL fails here, not at first use.
     pub fn new(server_url: String, token: String) -> Result<Self> {
+        // The token travels in an `Authorization` header on every request.
         let client = reqwest::Client::builder()
+            .default_headers(auth::default_headers(&token)?)
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -60,13 +63,17 @@ impl JupyterClient {
         })
     }
 
+    /// The token, for authenticating WebSocket upgrades.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Test connection to the server
     pub async fn test_connection(&self) -> Result<()> {
         let url = server_url::endpoint(&self.base_url, &["api"])?;
         let response = self
             .client
             .get(url)
-            .query(&[("token", &self.token)])
             .send()
             .await
             .context("Failed to connect to Jupyter Server")?;
@@ -87,7 +94,6 @@ impl JupyterClient {
         let response = self
             .client
             .get(url)
-            .query(&[("token", &self.token)])
             .send()
             .await
             .context("Failed to get kernel info")?;
@@ -109,7 +115,6 @@ impl JupyterClient {
         let response = self
             .client
             .get(url)
-            .query(&[("token", &self.token)])
             .send()
             .await
             .context("Failed to list kernels")?;
@@ -137,7 +142,6 @@ impl JupyterClient {
         let response = self
             .client
             .post(url)
-            .query(&[("token", &self.token)])
             .json(&payload)
             .send()
             .await
@@ -161,7 +165,6 @@ impl JupyterClient {
         let response = self
             .client
             .get(url)
-            .query(&[("token", &self.token)])
             .send()
             .await
             .context("Failed to list sessions")?;
@@ -200,7 +203,6 @@ impl JupyterClient {
         let response = self
             .client
             .post(url)
-            .query(&[("token", &self.token)])
             .json(&payload)
             .send()
             .await
@@ -244,7 +246,6 @@ impl JupyterClient {
         let response = self
             .client
             .post(url)
-            .query(&[("token", &self.token)])
             .json(&payload)
             .send()
             .await
@@ -270,7 +271,6 @@ impl JupyterClient {
         let response = self
             .client
             .post(url)
-            .query(&[("token", &self.token)])
             .send()
             .await
             .context("Failed to restart kernel")?;
@@ -292,7 +292,6 @@ impl JupyterClient {
         let response = self
             .client
             .delete(url)
-            .query(&[("token", &self.token)])
             .send()
             .await
             .context("Failed to delete session")?;
@@ -315,11 +314,7 @@ impl JupyterClient {
         let response = self
             .client
             .get(&url)
-            .query(&[
-                ("token", self.token.as_str()),
-                ("content", "1"),
-                ("type", "notebook"),
-            ])
+            .query(&[("content", "1"), ("type", "notebook")])
             .send()
             .await
             .context("Failed to fetch notebook from server")?;
@@ -357,7 +352,6 @@ impl JupyterClient {
         let response = self
             .client
             .put(&url)
-            .query(&[("token", self.token.as_str())])
             .json(&payload)
             .send()
             .await
@@ -380,7 +374,6 @@ impl JupyterClient {
         if let Some(sid) = session_id {
             url.query_pairs_mut().append_pair("session_id", sid);
         }
-        url.query_pairs_mut().append_pair("token", &self.token);
         url.to_string()
     }
 
@@ -398,7 +391,6 @@ impl JupyterClient {
         let response = self
             .client
             .post(url)
-            .query(&[("token", &self.token)])
             .json(&payload)
             .send()
             .await
@@ -426,7 +418,6 @@ impl JupyterClient {
         let response = self
             .client
             .post(url)
-            .query(&[("token", &self.token)])
             .json(request)
             .send()
             .await
@@ -551,20 +542,64 @@ mod tests {
         JupyterClient::new(base_url.to_string(), "tok".to_string()).unwrap()
     }
 
+    /// One-shot HTTP stub: returns the raw request it received.
+    async fn capture_request(token: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let body = "{}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let c = JupyterClient::new(format!("http://{}", addr), token.to_string()).unwrap();
+        c.test_connection().await.unwrap();
+        handle.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn rest_requests_use_authorization_header_not_url_token() {
+        let req = capture_request("tok").await;
+        let first_line = req.lines().next().unwrap();
+        assert!(
+            !first_line.contains("token"),
+            "token leaked into URL: {first_line}"
+        );
+        assert!(
+            req.to_lowercase().contains("authorization: token tok"),
+            "missing Authorization header in: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_requests_omit_authorization_header_for_empty_token() {
+        let req = capture_request("").await;
+        assert!(
+            !req.to_lowercase().contains("authorization"),
+            "unexpected Authorization header in: {req}"
+        );
+    }
+
     #[test]
     fn test_get_ws_url_formats() {
         let c = client("http://127.0.0.1:8888");
 
         let url = c.get_ws_url("kid1", None);
-        assert_eq!(
-            url,
-            "ws://127.0.0.1:8888/api/kernels/kid1/channels?token=tok"
-        );
+        assert_eq!(url, "ws://127.0.0.1:8888/api/kernels/kid1/channels");
 
         let url = c.get_ws_url("kid2", Some("sid42"));
         assert_eq!(
             url,
-            "ws://127.0.0.1:8888/api/kernels/kid2/channels?session_id=sid42&token=tok"
+            "ws://127.0.0.1:8888/api/kernels/kid2/channels?session_id=sid42"
         );
 
         let c_https = client("https://example.com");
@@ -589,16 +624,13 @@ mod tests {
         // keep the prefix, not rebuild from host/port.
         let c = client("https://host/jupyter");
         let url = c.get_ws_url("kid1", None);
-        assert_eq!(
-            url,
-            "wss://host/jupyter/api/kernels/kid1/channels?token=tok"
-        );
+        assert_eq!(url, "wss://host/jupyter/api/kernels/kid1/channels");
 
         let c = client("http://host:8888/foo/bar/");
         let url = c.get_ws_url("kid2", Some("sid"));
         assert_eq!(
             url,
-            "ws://host:8888/foo/bar/api/kernels/kid2/channels?session_id=sid&token=tok"
+            "ws://host:8888/foo/bar/api/kernels/kid2/channels?session_id=sid"
         );
     }
 

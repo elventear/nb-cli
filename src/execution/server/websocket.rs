@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use jupyter_protocol::messaging::{JupyterMessage, JupyterMessageContent};
 use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
     http::header::{HeaderValue, SEC_WEBSOCKET_PROTOCOL},
     Message,
 };
@@ -25,11 +24,10 @@ pub struct KernelWebSocket {
 }
 
 impl KernelWebSocket {
-    /// Connect to a kernel via WebSocket
-    pub async fn connect(ws_url: &str) -> Result<Self> {
-        let mut request = ws_url
-            .into_client_request()
-            .context("Invalid WebSocket URL")?;
+    /// Connect to a kernel via WebSocket, authenticating the upgrade with
+    /// `Authorization: token <token>` (no header if `token` is empty).
+    pub async fn connect(ws_url: &str, token: &str) -> Result<Self> {
+        let mut request = super::auth::ws_request(ws_url, token)?;
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("v1.kernel.websocket.jupyter.org"),
@@ -429,6 +427,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_sends_authorization_header_not_url_token() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut seen = None;
+            let _ = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
+                seen = Some((
+                    req.uri().to_string(),
+                    req.headers()
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_string()),
+                ));
+                Ok(resp)
+            })
+            .await;
+            seen.unwrap()
+        });
+
+        // The handshake fails (no v1 subprotocol echoed); we only inspect
+        // what the client sent.
+        let _ = KernelWebSocket::connect(
+            &format!("ws://{}/api/kernels/k/channels?session_id=s", addr),
+            "tok",
+        )
+        .await;
+        let (uri, auth) = seen.await.unwrap();
+        assert_eq!(uri, "/api/kernels/k/channels?session_id=s");
+        assert_eq!(auth.as_deref(), Some("token tok"));
+    }
+
+    #[tokio::test]
     async fn connect_rejects_server_without_v1_subprotocol() {
         // accept_async completes the WebSocket handshake without echoing any
         // subprotocol, which is how a legacy/incompatible server responds.
@@ -443,12 +474,15 @@ mod tests {
             }
         });
 
-        let err = match KernelWebSocket::connect(&format!("ws://{}/api/kernels/k/channels", addr))
-            .await
-        {
-            Ok(_) => panic!("connect must fail when the server does not accept the v1 subprotocol"),
-            Err(e) => e,
-        };
+        let err =
+            match KernelWebSocket::connect(&format!("ws://{}/api/kernels/k/channels", addr), "")
+                .await
+            {
+                Ok(_) => {
+                    panic!("connect must fail when the server does not accept the v1 subprotocol")
+                }
+                Err(e) => e,
+            };
         let full = format!("{:#}", err);
         assert!(
             full.contains("WebSocket v1 kernel protocol")
